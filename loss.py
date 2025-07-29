@@ -29,107 +29,40 @@ class SchedulerOutput:
     d_sigma_t: Tensor = field(metadata={"help": "Derivative of sigma_t."})
 
 
-class Scheduler(ABC):
-    """Base Scheduler class."""
-
-    @abstractmethod
-    def __call__(self, t: Tensor) -> SchedulerOutput:
-        r"""
-        Args:
-            t (Tensor): times in [0,1], shape (...).
-
-        Returns:
-            SchedulerOutput: :math:`\alpha_t,\sigma_t,\frac{\partial}{\partial t}\alpha_t,\frac{\partial}{\partial t}\sigma_t`
+class TimeSchedulerWrapper:
+    """
+    Wrapper to make your existing time_scheduler work with Flow Matching.
+    This converts your time_scheduler values to the format expected by Flow Matching.
+    """
+    
+    def __init__(self, time_scheduler: Tensor):
         """
-        ...
-
-    @abstractmethod
-    def snr_inverse(self, snr: Tensor) -> Tensor:
-        r"""
-        Computes :math:`t` from the signal-to-noise ratio :math:`\frac{\alpha_t}{\sigma_t}`.
-
         Args:
-            snr (Tensor): The signal-to-noise, shape (...)
-
-        Returns:
-            Tensor: t, shape (...)
+            time_scheduler: Your existing time scheduler tensor, e.g., 
+                          torch.linspace(1/num_timesteps, 1, steps=num_timesteps)
         """
-        ...
-
-
-class ConvexScheduler(Scheduler):
-    @abstractmethod
-    def __call__(self, t: Tensor) -> SchedulerOutput:
-        r"""Scheduler for convex paths.
-
+        self.time_scheduler = time_scheduler
+        
+    def __call__(self, timesteps: Tensor) -> SchedulerOutput:
+        """
+        Convert timestep indices to Flow Matching scheduler output.
+        
         Args:
-            t (Tensor): times in [0,1], shape (...).
-
+            timesteps: Tensor of timestep indices, shape (batch_size,)
+            
         Returns:
-            SchedulerOutput: :math:`\alpha_t,\sigma_t,\frac{\partial}{\partial t}\alpha_t,\frac{\partial}{\partial t}\sigma_t`
+            SchedulerOutput with alpha_t, sigma_t, and derivatives
         """
-        ...
-
-    @abstractmethod
-    def kappa_inverse(self, kappa: Tensor) -> Tensor:
-        r"""
-        Computes :math:`t` from :math:`\kappa_t`.
-
-        Args:
-            kappa (Tensor): :math:`\kappa`, shape (...)
-
-        Returns:
-            Tensor: t, shape (...)
-        """
-        ...
-
-    def snr_inverse(self, snr: Tensor) -> Tensor:
-        r"""
-        Computes :math:`t` from the signal-to-noise ratio :math:`\frac{\alpha_t}{\sigma_t}`.
-
-        Args:
-            snr (Tensor): The signal-to-noise, shape (...)
-
-        Returns:
-            Tensor: t, shape (...)
-        """
-        kappa_t = snr / (1.0 + snr)
-        return self.kappa_inverse(kappa=kappa_t)
-
-
-class PolynomialConvexScheduler(ConvexScheduler):
-    """Polynomial Scheduler adapted for discrete diffusion training."""
-
-    def __init__(self, n: Union[float, int] = 1.0) -> None:
-        assert isinstance(n, (float, int)), f"`n` must be a float or int. Got {type(n)=}."
-        assert n > 0, f"`n` must be positive. Got {n=}."
-        self.n = n
-
-    def __call__(self, t: Tensor) -> SchedulerOutput:
-        return SchedulerOutput(
-            alpha_t=t**self.n,
-            sigma_t=1 - t**self.n,
-            d_alpha_t=self.n * (t ** (self.n - 1)),
-            d_sigma_t=-self.n * (t ** (self.n - 1)),
-        )
-
-    def kappa_inverse(self, kappa: Tensor) -> Tensor:
-        return torch.pow(kappa, 1.0 / self.n)
-
-
-class LinearScheduler(ConvexScheduler):
-    """Linear scheduler for discrete diffusion training."""
-
-    def __call__(self, t: Tensor) -> SchedulerOutput:
+        # Get time values from your scheduler
+        t = self.time_scheduler[timesteps]
+        
+        # Flow Matching linear scheduler: alpha_t = t, sigma_t = 1 - t
         return SchedulerOutput(
             alpha_t=t,
             sigma_t=1 - t,
             d_alpha_t=torch.ones_like(t),
             d_sigma_t=-torch.ones_like(t),
         )
-
-    def kappa_inverse(self, kappa: Tensor) -> Tensor:
-        return kappa
 
 
 @dataclass
@@ -160,83 +93,59 @@ class MixtureDiscreteProbPath:
 
     This path remains constant at the source data point :math:`X_0` until a random time, 
     determined by the scheduler, when it flips to the target data point :math:`X_1`.
-    The scheduler determines the flip probability using the parameter :math:`\sigma_t`.
 
     Args:
-        scheduler (ConvexScheduler): The scheduler that provides :math:`\sigma_t`.
+        time_scheduler (Tensor): Your existing time scheduler tensor.
     """
 
-    def __init__(self, scheduler: ConvexScheduler):
-        assert isinstance(scheduler, ConvexScheduler), "Scheduler must be a ConvexScheduler."
-        self.scheduler = scheduler
+    def __init__(self, time_scheduler: Tensor):
+        self.scheduler = TimeSchedulerWrapper(time_scheduler)
 
-    def assert_sample_shape(self, x_0: Tensor, x_1: Tensor, t: Tensor):
+    def assert_sample_shape(self, x_0: Tensor, x_1: Tensor, timesteps: Tensor):
         r"""Assert that input tensors have compatible shapes."""
         assert x_0.shape == x_1.shape, f"x_0 and x_1 must have same shape, got {x_0.shape} vs {x_1.shape}"
-        assert t.shape[0] == x_0.shape[0], f"Batch dimension mismatch: t={t.shape[0]}, x_0={x_0.shape[0]}"
+        assert timesteps.shape[0] == x_0.shape[0], f"Batch dimension mismatch: timesteps={timesteps.shape[0]}, x_0={x_0.shape[0]}"
 
-    def sample(self, x_0: Tensor, x_1: Tensor, t: Tensor) -> DiscretePathSample:
+    def sample(self, x_0: Tensor, x_1: Tensor, timesteps: Tensor) -> DiscretePathSample:
         r"""Sample from the discrete probability path.
         
         Args:
             x_0 (Tensor): source data point, shape (batch_size, ...).
             x_1 (Tensor): target data point, shape (batch_size, ...).
-            t (Tensor): times in [0,1], shape (batch_size).
+            timesteps (Tensor): timestep indices, shape (batch_size).
 
         Returns:
             DiscretePathSample: a conditional sample at :math:`X_t ~ p_t`.
         """
-        self.assert_sample_shape(x_0=x_0, x_1=x_1, t=t)
+        self.assert_sample_shape(x_0=x_0, x_1=x_1, timesteps=timesteps)
 
-        sigma_t = self.scheduler(t).sigma_t
+        scheduler_output = self.scheduler(timesteps)
+        sigma_t = scheduler_output.sigma_t
         sigma_t = expand_tensor_like(input_tensor=sigma_t, expand_to=x_1)
 
         source_indices = torch.rand(size=x_1.shape, device=x_1.device) < sigma_t
         x_t = torch.where(condition=source_indices, input=x_0, other=x_1)
 
-        return DiscretePathSample(x_t=x_t, x_1=x_1, x_0=x_0, t=t)
-
-    def posterior_to_velocity(self, posterior_logits: Tensor, x_t: Tensor, t: Tensor) -> Tensor:
-        r"""Convert the factorized posterior to velocity.
-
-        Args:
-            posterior_logits (Tensor): logits of the x_1 posterior conditional on x_t, shape (..., vocab size).
-            x_t (Tensor): path sample at time t, shape (...).
-            t (Tensor): time in [0,1].
-
-        Returns:
-            Tensor: velocity.
-        """
-        posterior = torch.softmax(posterior_logits, dim=-1)
-        vocabulary_size = posterior.shape[-1]
-        x_t = F.one_hot(x_t, num_classes=vocabulary_size)
-        t = unsqueeze_to_match(source=t, target=x_t)
-
-        scheduler_output = self.scheduler(t)
-
-        kappa_t = scheduler_output.alpha_t
-        d_kappa_t = scheduler_output.d_alpha_t
-
-        return (d_kappa_t / (1 - kappa_t)) * (posterior - x_t)
+        return DiscretePathSample(x_t=x_t, x_1=x_1, x_0=x_0, t=scheduler_output.alpha_t)
 
 
 class MixturePathGeneralizedKL(_Loss):
     r"""A generalized KL loss for discrete flow matching adapted for diffusion training.
     
     This class measures the generalized KL of a discrete flow model w.r.t. a probability 
-    path given by ``path``. It's adapted to work with the discrete diffusion training setup.
+    path given by ``path``. It's adapted to work with your existing time_scheduler.
 
     Args:
-        path (MixtureDiscreteProbPath): Probability path (x-prediction training).
+        time_scheduler (Tensor): Your existing time scheduler tensor.
         reduction (str, optional): Specify the reduction to apply to the output 
             ``'none'`` | ``'mean'`` | ``'sum'``. Defaults to 'mean'.
     """
 
-    def __init__(self, path: MixtureDiscreteProbPath, reduction: str = "mean") -> None:
+    def __init__(self, time_scheduler: Tensor, reduction: str = "mean") -> None:
         super().__init__(None, None, reduction)
-        self.path = path
+        self.path = MixtureDiscreteProbPath(time_scheduler)
 
-    def forward(self, logits: Tensor, x_1: Tensor, x_t: Tensor, t: Tensor, 
+    def forward(self, logits: Tensor, x_1: Tensor, x_t: Tensor, timesteps: Tensor, 
                 attention_mask: Tensor = None) -> Tensor:
         r"""Evaluates the generalized KL loss adapted for diffusion training.
 
@@ -246,7 +155,7 @@ class MixturePathGeneralizedKL(_Loss):
             x_1 (Tensor): target data point (clean tokens), shape (batch, seq_len).
             x_t (Tensor): conditional sample at x_t ~ p_t(·|x_1) (noised tokens), 
                          shape (batch, seq_len).
-            t (Tensor): times in [0,1], shape (batch).
+            timesteps (Tensor): timestep indices, shape (batch).
             attention_mask (Tensor, optional): attention mask, shape (batch, seq_len).
 
         Returns:
@@ -264,7 +173,7 @@ class MixturePathGeneralizedKL(_Loss):
         p_1t_xt = torch.gather(p_1t, dim=-1, index=x_t.unsqueeze(-1))
         p_1t_xt = p_1t_xt.view(*x_1_shape)
 
-        scheduler_output = self.path.scheduler(t)
+        scheduler_output = self.path.scheduler(timesteps)
 
         jump_coefficient = (
             scheduler_output.d_alpha_t / (1 - scheduler_output.alpha_t)
@@ -336,25 +245,3 @@ class DiscreteDiffusionLoss(_Loss):
             return loss
         else:
             raise ValueError(f"{self.reduction} is not a valid value for reduction")
-
-
-def create_time_scheduler(num_timesteps: int, scheduler_type: str = "linear", device: str = "cpu") -> Tensor:
-    """
-    Create a time scheduler tensor compatible with your training loop.
-    
-    Args:
-        num_timesteps (int): Number of timesteps
-        scheduler_type (str): Type of scheduler ("linear" or "polynomial")
-        device (str): Device to place the tensor on
-        
-    Returns:
-        Tensor: Time scheduler tensor of shape (num_timesteps,)
-    """
-    if scheduler_type == "linear":
-        return torch.linspace(1 / num_timesteps, 1, steps=num_timesteps, dtype=torch.float32, device=device)
-    elif scheduler_type == "polynomial":
-        # Polynomial schedule with n=2 for more aggressive noise schedule
-        t = torch.linspace(0, 1, steps=num_timesteps, dtype=torch.float32, device=device)
-        return t ** 2
-    else:
-        raise ValueError(f"Unknown scheduler_type: {scheduler_type}")
