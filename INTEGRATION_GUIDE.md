@@ -2,6 +2,139 @@
 
 This guide shows exactly how to modify your existing training code to use the adapted Flow Matching loss.
 
+## Option 1: Use Your Existing time_scheduler (Recommended)
+
+This approach requires **zero changes** to your time scheduling logic:
+
+### Step 1: Import the helper function
+```python
+from loss import training_step_with_existing_scheduler
+```
+
+### Step 2: Replace your training step
+In your training loop, replace the loss calculation with:
+
+```python
+# Your existing setup (no changes needed!)
+time_scheduler = torch.linspace(
+    1 / num_timesteps,
+    1,
+    steps=num_timesteps,
+    dtype=torch.float32,
+    device=accelerator.device,
+)
+
+# In your training loop:
+for batch in train_loader:
+    # OLD CODE (replace this entire block):
+    # input_ids = batch["input_ids"]
+    # attention_mask = batch["attention_mask"].bool()
+    # timesteps = torch.randint(0, num_timesteps, (input_ids.shape[0],), device=accelerator.device)
+    # time_t = time_scheduler[timesteps]
+    # noised_input_ids = model._create_noise_ids(input_ids, time_scheduler[timesteps.unsqueeze(1)])
+    # logits = model(noised_input_ids, attention_mask, time_t)
+    # target = input_ids.clone()
+    # target[noised_input_ids != model.mask_token_id] = -100
+    # target[attention_mask == 0] = -100
+    # loss = F.cross_entropy(input=logits.transpose(-1, -2), target=target, reduction="mean")
+    
+    # NEW CODE (single function call):
+    loss, logits, noised_input_ids = training_step_with_existing_scheduler(
+        model=model,
+        batch=batch,
+        num_timesteps=num_timesteps,
+        time_scheduler=time_scheduler,  # Your existing scheduler!
+        accelerator=accelerator,
+        loss_type="discrete"  # or "flow_matching" for full Flow Matching
+    )
+    
+    # Rest of your training loop stays the same
+    accelerator.backward(loss)
+    # ... optimizer step, etc.
+```
+
+### Step 3: Choose your loss type
+```python
+# For minimal changes (improved cross-entropy):
+loss_type="discrete"
+
+# For full Flow Matching benefits:
+loss_type="flow_matching"
+```
+
+## Option 2: Manual Integration with time_scheduler
+
+If you prefer more control:
+
+### For Discrete Diffusion Loss:
+```python
+from loss import DiscreteDiffusionLoss
+
+# Initialize once
+loss_fn = DiscreteDiffusionLoss(mask_token_id=model.mask_token_id, reduction="mean")
+
+# In your training loop (minimal changes):
+for batch in train_loader:
+    input_ids = batch["input_ids"]
+    attention_mask = batch["attention_mask"].bool()
+    
+    # Your existing time sampling (no changes)
+    timesteps = torch.randint(0, num_timesteps, (input_ids.shape[0],), device=accelerator.device)
+    time_t = time_scheduler[timesteps]
+    
+    # Your existing noise creation (no changes)
+    noised_input_ids = model._create_noise_ids(input_ids, time_scheduler[timesteps.unsqueeze(1)])
+    
+    # Forward pass (no changes)
+    logits = model(noised_input_ids, attention_mask, time_t)
+    
+    # Your existing target preparation (no changes)
+    target = input_ids.clone()
+    target[noised_input_ids != model.mask_token_id] = -100
+    target[attention_mask == 0] = -100
+    
+    # ONLY CHANGE: Replace F.cross_entropy with new loss
+    loss = loss_fn(logits=logits, target=target, attention_mask=attention_mask)
+```
+
+### For Flow Matching Loss:
+```python
+from loss import create_flow_matching_loss_with_scheduler
+
+# Initialize once
+path, flow_loss_fn = create_flow_matching_loss_with_scheduler(
+    mask_token_id=model.mask_token_id,
+    scheduler_type="linear"
+)
+
+# In your training loop:
+for batch in train_loader:
+    input_ids = batch["input_ids"]
+    attention_mask = batch["attention_mask"].bool()
+    
+    # Your existing time sampling (no changes)
+    timesteps = torch.randint(0, num_timesteps, (input_ids.shape[0],), device=accelerator.device)
+    time_t = time_scheduler[timesteps]
+    
+    # Flow Matching path sampling (replaces model._create_noise_ids)
+    x_0 = torch.full_like(input_ids, model.mask_token_id)
+    time_normalized = (time_t - time_t.min()) / (time_t.max() - time_t.min())
+    path_sample = path.sample(x_0=x_0, x_1=input_ids, t=time_normalized)
+    noised_input_ids = path_sample.x_t
+    
+    # Forward pass (no changes)
+    logits = model(noised_input_ids, attention_mask, time_t)
+    
+    # Flow Matching loss (handles time normalization automatically)
+    loss = flow_loss_fn(
+        logits=logits,
+        x_1=input_ids,
+        x_t=noised_input_ids,
+        t=time_t,  # Your original time_scheduler values!
+        attention_mask=attention_mask
+    )
+```
+
 ## Quick Integration (Minimal Changes)
 
 If you want to make minimal changes to your existing code, use the `DiscreteDiffusionLoss`:
@@ -96,51 +229,27 @@ for batch in train_loader:
     # ... optimizer step, etc.
 ```
 
+## Why Use Your Existing time_scheduler?
+
+1. **Zero Changes**: Your time sampling logic stays exactly the same
+2. **Consistent**: Same time values go to your model
+3. **Compatible**: Works with your existing `model._create_noise_ids()` method
+4. **Flexible**: Easy to switch between loss types
+
 ## Key Differences Between Approaches
 
-| Aspect | Original Code | DiscreteDiffusionLoss | Flow Matching |
-|--------|---------------|----------------------|---------------|
-| **Changes Required** | - | Minimal (just loss function) | Moderate (sampling logic) |
-| **Time Normalization** | `time_scheduler[timesteps]` | Same as original | `timesteps.float() / num_timesteps` |
-| **Noise Creation** | `model._create_noise_ids()` | Same as original | `path.sample()` |
-| **Loss Calculation** | `F.cross_entropy()` | `loss_fn(logits, target, mask)` | `loss_fn(logits, x_1, x_t, t, mask)` |
-| **Theoretical Foundation** | Standard CE | Improved CE with masking | Flow Matching theory |
+| Aspect | Original Code | With time_scheduler | Without time_scheduler |
+|--------|---------------|---------------------|----------------------|
+| **Time Sampling** | `time_scheduler[timesteps]` | Same | `timesteps.float() / num_timesteps` |
+| **Noise Creation** | `model._create_noise_ids()` | Same | `path.sample()` |
+| **Model Input** | `time_scheduler` values | Same | Normalized `[0,1]` values |
+| **Changes Required** | - | Minimal | Moderate |
 
 ## Recommended Approach
 
-1. **Start with DiscreteDiffusionLoss**: Make minimal changes and see if you get improvements
-2. **If satisfied**: Stop here, you're done!
-3. **If you want more**: Try the full Flow Matching approach for potentially better gradients and training dynamics
+1. **Start with Option 1**: Use `training_step_with_existing_scheduler()` with `loss_type="discrete"`
+2. **Test**: Compare training metrics with your original setup
+3. **Upgrade**: Try `loss_type="flow_matching"` if you want full Flow Matching benefits
+4. **Optimize**: Fine-tune based on your results
 
-## Expected Benefits
-
-### DiscreteDiffusionLoss
-- Better handling of attention masks
-- More robust loss computation
-- Minimal code changes
-
-### Full Flow Matching
-- Theoretically grounded approach
-- Potentially better gradient flow
-- State-of-the-art generative modeling framework
-- Better handling of the noise-to-data transition
-
-## Troubleshooting
-
-### Common Issues
-
-1. **Shape mismatches**: Make sure your model's output shape is `(batch, seq_len, vocab_size)`
-2. **Time normalization**: Flow Matching expects times in `[0, 1]`, your original code might use different ranges
-3. **Mask token ID**: Make sure you're using the correct mask token ID for your tokenizer
-
-### Debug Tips
-
-1. **Print shapes**: Add debug prints to check tensor shapes at each step
-2. **Compare losses**: Run both old and new loss side-by-side to compare values
-3. **Start small**: Test with a small batch first before full training
-
-## Performance Notes
-
-- The `DiscreteDiffusionLoss` should have similar performance to your original code
-- The full Flow Matching approach might be slightly slower due to path sampling, but should provide better training dynamics
-- Both approaches are fully compatible with your existing accelerator setup
+This approach lets you get the benefits of the improved loss functions while keeping your existing, working time scheduling logic intact!

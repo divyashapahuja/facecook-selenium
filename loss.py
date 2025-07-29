@@ -230,11 +230,29 @@ class MixturePathGeneralizedKL(_Loss):
         path (MixtureDiscreteProbPath): Probability path (x-prediction training).
         reduction (str, optional): Specify the reduction to apply to the output 
             ``'none'`` | ``'mean'`` | ``'sum'``. Defaults to 'mean'.
+        normalize_time (bool, optional): Whether to normalize time values to [0,1]. 
+            Set to True if using time_scheduler from training code. Defaults to False.
     """
 
-    def __init__(self, path: MixtureDiscreteProbPath, reduction: str = "mean") -> None:
+    def __init__(self, path: MixtureDiscreteProbPath, reduction: str = "mean", normalize_time: bool = False) -> None:
         super().__init__(None, None, reduction)
         self.path = path
+        self.normalize_time = normalize_time
+
+    def _normalize_time_if_needed(self, t: Tensor) -> Tensor:
+        """Convert time_scheduler values to [0,1] range if needed."""
+        if self.normalize_time:
+            # Assume time_scheduler goes from 1/num_timesteps to 1.0
+            # Convert to [0, 1] range: (t - min_val) / (max_val - min_val)
+            # Since min_val ≈ 0 and max_val = 1, this is approximately just t
+            # But let's be more precise:
+            min_val = t.min()
+            max_val = t.max()
+            if max_val > min_val:
+                return (t - min_val) / (max_val - min_val)
+            else:
+                return t
+        return t
 
     def forward(self, logits: Tensor, x_1: Tensor, x_t: Tensor, t: Tensor, 
                 attention_mask: Tensor = None) -> Tensor:
@@ -246,12 +264,15 @@ class MixturePathGeneralizedKL(_Loss):
             x_1 (Tensor): target data point (clean tokens), shape (batch, seq_len).
             x_t (Tensor): conditional sample at x_t ~ p_t(·|x_1) (noised tokens), 
                          shape (batch, seq_len).
-            t (Tensor): times in [0,1], shape (batch).
+            t (Tensor): times (will be normalized to [0,1] if normalize_time=True), shape (batch).
             attention_mask (Tensor, optional): attention mask, shape (batch, seq_len).
 
         Returns:
             Tensor: Generalized KL loss.
         """
+        # Normalize time if using time_scheduler
+        t_normalized = self._normalize_time_if_needed(t)
+        
         x_1_shape = x_1.shape
 
         # Extract x_1 value of log(p_{1|t}(x|x_t))
@@ -264,7 +285,7 @@ class MixturePathGeneralizedKL(_Loss):
         p_1t_xt = torch.gather(p_1t, dim=-1, index=x_t.unsqueeze(-1))
         p_1t_xt = p_1t_xt.view(*x_1_shape)
 
-        scheduler_output = self.path.scheduler(t)
+        scheduler_output = self.path.scheduler(t_normalized)
 
         jump_coefficient = (
             scheduler_output.d_alpha_t / (1 - scheduler_output.alpha_t)
@@ -358,3 +379,116 @@ def create_time_scheduler(num_timesteps: int, scheduler_type: str = "linear", de
         return t ** 2
     else:
         raise ValueError(f"Unknown scheduler_type: {scheduler_type}")
+
+
+def training_step_with_existing_scheduler(
+    model, 
+    batch, 
+    num_timesteps, 
+    time_scheduler,
+    accelerator,
+    loss_type="discrete",  # "discrete" or "flow_matching"
+    mask_token_id=None
+):
+    """
+    Training step that works with your existing time_scheduler setup.
+    
+    Args:
+        model: Your DFLM model
+        batch: Training batch with input_ids and attention_mask
+        num_timesteps: Number of timesteps (e.g., 512)
+        time_scheduler: Your existing time_scheduler tensor
+        accelerator: Accelerator instance
+        loss_type: "discrete" for DiscreteDiffusionLoss, "flow_matching" for Flow Matching loss
+        mask_token_id: Mask token ID (will try to get from model if None)
+        
+    Returns:
+        loss: Computed loss
+        logits: Model predictions
+        noised_input_ids: Noised input tokens
+    """
+    input_ids = batch["input_ids"]
+    attention_mask = batch["attention_mask"].bool()
+    
+    if mask_token_id is None:
+        mask_token_id = getattr(model, 'mask_token_id', 0)
+    
+    # Sample timesteps (same as your original code)
+    timesteps = torch.randint(0, num_timesteps, (input_ids.shape[0],), device=accelerator.device)
+    time_t = time_scheduler[timesteps]  # Use your existing scheduler!
+    
+    if loss_type == "discrete":
+        # Use the simple discrete diffusion loss (minimal changes)
+        loss_fn = DiscreteDiffusionLoss(mask_token_id=mask_token_id, reduction="mean")
+        
+        # Create noised inputs (same as your original code)
+        noised_input_ids = model._create_noise_ids(input_ids, time_scheduler[timesteps.unsqueeze(1)])
+        
+        # Forward pass
+        logits = model(noised_input_ids, attention_mask, time_t)
+        
+        # Prepare target (same as your original code)
+        target = input_ids.clone()
+        target[noised_input_ids != mask_token_id] = -100
+        target[attention_mask == 0] = -100
+        
+        # Compute loss
+        loss = loss_fn(logits=logits, target=target, attention_mask=attention_mask)
+        
+    elif loss_type == "flow_matching":
+        # Use Flow Matching loss with time normalization
+        scheduler = LinearScheduler()
+        path = MixtureDiscreteProbPath(scheduler)
+        loss_fn = MixturePathGeneralizedKL(path, reduction="mean", normalize_time=True)
+        
+        # Create noise (mask tokens)
+        x_0 = torch.full_like(input_ids, mask_token_id)
+        
+        # For Flow Matching, we need to convert time to [0,1] for path sampling
+        # but the loss function will handle this automatically with normalize_time=True
+        time_normalized = time_t  # We'll let the loss function normalize this
+        
+        # Sample from path (using normalized time)
+        time_for_sampling = (time_t - time_t.min()) / (time_t.max() - time_t.min()) if time_t.max() > time_t.min() else time_t
+        path_sample = path.sample(x_0=x_0, x_1=input_ids, t=time_for_sampling)
+        noised_input_ids = path_sample.x_t
+        
+        # Forward pass
+        logits = model(noised_input_ids, attention_mask, time_t)  # Use original time_t for model
+        
+        # Compute Flow Matching loss (it will normalize time internally)
+        loss = loss_fn(
+            logits=logits,
+            x_1=input_ids,
+            x_t=noised_input_ids,
+            t=time_t,  # Pass original time_scheduler values
+            attention_mask=attention_mask
+        )
+    else:
+        raise ValueError(f"Unknown loss_type: {loss_type}")
+    
+    return loss, logits, noised_input_ids
+
+
+def create_flow_matching_loss_with_scheduler(mask_token_id=0, scheduler_type="linear"):
+    """
+    Helper function to create Flow Matching loss that works with your time_scheduler.
+    
+    Args:
+        mask_token_id: Mask token ID
+        scheduler_type: "linear" or "polynomial"
+        
+    Returns:
+        Tuple of (path, loss_fn) ready to use with your existing time_scheduler
+    """
+    if scheduler_type == "linear":
+        scheduler = LinearScheduler()
+    elif scheduler_type == "polynomial":
+        scheduler = PolynomialConvexScheduler(n=1.0)
+    else:
+        raise ValueError(f"Unknown scheduler_type: {scheduler_type}")
+    
+    path = MixtureDiscreteProbPath(scheduler)
+    loss_fn = MixturePathGeneralizedKL(path, reduction="mean", normalize_time=True)
+    
+    return path, loss_fn
