@@ -8,9 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 from torch.nn.modules.loss import _Loss
-from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Union
 
 
 @dataclass
@@ -65,29 +63,6 @@ class TimeSchedulerWrapper:
         )
 
 
-@dataclass
-class DiscretePathSample:
-    """Represents a sample from a discrete probability path."""
-    x_t: Tensor = field(metadata={"help": "Sample at time t"})
-    x_1: Tensor = field(metadata={"help": "Target data point"})
-    x_0: Tensor = field(metadata={"help": "Source data point"})
-    t: Tensor = field(metadata={"help": "Time"})
-
-
-def expand_tensor_like(input_tensor: Tensor, expand_to: Tensor) -> Tensor:
-    """Expand input_tensor to match the shape of expand_to."""
-    while input_tensor.dim() < expand_to.dim():
-        input_tensor = input_tensor.unsqueeze(-1)
-    return input_tensor.expand_as(expand_to)
-
-
-def unsqueeze_to_match(source: Tensor, target: Tensor) -> Tensor:
-    """Unsqueeze source tensor to match target tensor dimensions."""
-    while source.dim() < target.dim():
-        source = source.unsqueeze(-1)
-    return source
-
-
 class MixtureDiscreteProbPath:
     r"""The ``MixtureDiscreteProbPath`` class defines a factorized discrete probability path.
 
@@ -101,39 +76,13 @@ class MixtureDiscreteProbPath:
     def __init__(self, time_scheduler: Tensor):
         self.scheduler = TimeSchedulerWrapper(time_scheduler)
 
-    def assert_sample_shape(self, x_0: Tensor, x_1: Tensor, timesteps: Tensor):
-        r"""Assert that input tensors have compatible shapes."""
-        assert x_0.shape == x_1.shape, f"x_0 and x_1 must have same shape, got {x_0.shape} vs {x_1.shape}"
-        assert timesteps.shape[0] == x_0.shape[0], f"Batch dimension mismatch: timesteps={timesteps.shape[0]}, x_0={x_0.shape[0]}"
-
-    def sample(self, x_0: Tensor, x_1: Tensor, timesteps: Tensor) -> DiscretePathSample:
-        r"""Sample from the discrete probability path.
-        
-        Args:
-            x_0 (Tensor): source data point, shape (batch_size, ...).
-            x_1 (Tensor): target data point, shape (batch_size, ...).
-            timesteps (Tensor): timestep indices, shape (batch_size).
-
-        Returns:
-            DiscretePathSample: a conditional sample at :math:`X_t ~ p_t`.
-        """
-        self.assert_sample_shape(x_0=x_0, x_1=x_1, timesteps=timesteps)
-
-        scheduler_output = self.scheduler(timesteps)
-        sigma_t = scheduler_output.sigma_t
-        sigma_t = expand_tensor_like(input_tensor=sigma_t, expand_to=x_1)
-
-        source_indices = torch.rand(size=x_1.shape, device=x_1.device) < sigma_t
-        x_t = torch.where(condition=source_indices, input=x_0, other=x_1)
-
-        return DiscretePathSample(x_t=x_t, x_1=x_1, x_0=x_0, t=scheduler_output.alpha_t)
-
 
 class MixturePathGeneralizedKL(_Loss):
     r"""A generalized KL loss for discrete flow matching adapted for diffusion training.
     
     This class measures the generalized KL of a discrete flow model w.r.t. a probability 
-    path given by ``path``. It's adapted to work with your existing time_scheduler.
+    path given by ``path``. It's adapted to work with your existing time_scheduler and
+    model._create_noise_ids() method.
 
     Args:
         time_scheduler (Tensor): Your existing time scheduler tensor.
@@ -153,7 +102,7 @@ class MixturePathGeneralizedKL(_Loss):
             logits (Tensor): posterior model output (i.e., softmax(``logits``) = p_{1|t}(x|x_t)), 
                            shape (batch, seq_len, vocab_size).
             x_1 (Tensor): target data point (clean tokens), shape (batch, seq_len).
-            x_t (Tensor): conditional sample at x_t ~ p_t(·|x_1) (noised tokens), 
+            x_t (Tensor): conditional sample at x_t ~ p_t(·|x_1) (noised tokens from model._create_noise_ids), 
                          shape (batch, seq_len).
             timesteps (Tensor): timestep indices, shape (batch).
             attention_mask (Tensor, optional): attention mask, shape (batch, seq_len).
